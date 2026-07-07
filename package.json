@@ -1,0 +1,7 @@
+{
+  "name": "robo-agenda",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node avisoagendaecaptacao.js"
+  }
+}

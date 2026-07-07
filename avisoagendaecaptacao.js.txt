@@ -1,0 +1,181 @@
+// avisoagendaecaptacao.js
+// Requisito: Node.js 18+ (que possui fetch nativo)
+
+const TOKEN_TELEGRAM = "8788230129:AAETDUtmPQCqJkBYVyyPg0IMnG8G1YUmvfw";
+const CHAT_ID = "-5223127268";
+const FIREBASE_URL = "https://agenda-inquilino-default-rtdb.firebaseio.com";
+
+// Função para sanitizar caracteres especiais e impedir quebra do HTML no Telegram
+function escapeHTML(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+async function enviarMensagemTelegram(texto) {
+    try {
+        const response = await fetch(`https://api.telegram.org/bot${TOKEN_TELEGRAM}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: CHAT_ID,
+                text: texto,
+                parse_mode: 'HTML',
+                disable_web_page_preview: true
+            })
+        });
+        if (!response.ok) {
+            console.error("Erro no Telegram:", await response.text());
+        }
+    } catch (error) {
+        console.error("Erro de conexão com o Telegram:", error);
+    }
+}
+
+async function atualizarLembreteFirebase(hojeStr, agendamentoId, dadosAtualizar) {
+    try {
+        await fetch(`${FIREBASE_URL}/agendamentos/${hojeStr}/${agendamentoId}.json`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(dadosAtualizar)
+        });
+    } catch (error) {
+        console.error("Erro ao atualizar Firebase:", error);
+    }
+}
+
+function gerarTextoConfirmacao(ag) {
+    const isVistoria = ag.tipoNegocio && ag.tipoNegocio.includes('Vistoria');
+    const clienteFim = isVistoria ? (ag.nomeInquilino || 'Inquilino') : (ag.cliente || 'Cliente');
+    const horaStr = String(ag.horaFixa || ag.hourFixa).padStart(2, '0');
+    const minStr = String(ag.minuto).padStart(2, '0');
+    const hora = `${horaStr}:${minStr}`;
+    let textoImovel = ag.endereco || '';
+    
+    if (ag.tipoImovel === 'casa' && ag.numCasa) textoImovel += ` Nº ${ag.numCasa}`;
+    else if (ag.tipoImovel === 'apartamento') {
+        if (ag.condominio) textoImovel += ` Cond. ${ag.condominio}`;
+        if (ag.bloco) textoImovel += ` Bloco ${ag.bloco}`;
+        if (ag.numApto) textoImovel += ` Apto ${ag.numApto}`;
+    }
+    if (!textoImovel) textoImovel = "não informado";
+
+    let msg = '';
+    if (ag.tipoNegocio === 'Aluguel' || ag.tipoNegocio === 'Venda') {
+        msg = `Olá, ${clienteFim} tem uma visita no imóvel ${textoImovel} as ${hora} confirma?`;
+    } else if (ag.tipoNegocio === 'Vistoria Saída' || ag.tipoNegocio === 'Vistoria Entrada') {
+        msg = `Olá, ${clienteFim} tem uma vistoria no imóvel ${textoImovel} as ${hora} confirma?`;
+    } else {
+        msg = `Olá, ${clienteFim} tem um agendamento no imóvel ${textoImovel} as ${hora} confirma?`;
+    }
+    return msg;
+}
+
+async function verificarAgendamentos() {
+    // Garante que o horário lido seja o de Brasília
+    const agora = new Date(new Date().toLocaleString("en-US", {timeZone: "America/Sao_Paulo"}));
+    
+    const y = agora.getFullYear();
+    const m = String(agora.getMonth() + 1).padStart(2, '0');
+    const d = String(agora.getDate()).padStart(2, '0');
+    const hojeStr = `${y}-${m}-${d}`;
+
+    const tempoAtualEmMinutos = (agora.getHours() * 60) + agora.getMinutes();
+
+    try {
+        const response = await fetch(`${FIREBASE_URL}/agendamentos/${hojeStr}.json`);
+        const agendamentosDeHoje = await response.json();
+
+        if (!agendamentosDeHoje) {
+            console.log(`[${agora.toLocaleTimeString()}] Nenhum agendamento para hoje.`);
+            return;
+        }
+
+        for (const [id, ag] of Object.entries(agendamentosDeHoje)) {
+            if ((ag.horaFixa || ag.hourFixa) === "Extra" || ag.status === "cancelado" || ag.status === "remarcou") continue;
+
+            const tempoAgendamentoEmMinutos = (parseInt(ag.horaFixa || ag.hourFixa) * 60) + parseInt(ag.minuto);
+            const minFaltando = tempoAgendamentoEmMinutos - tempoAtualEmMinutos;
+
+            let dispararAviso = false;
+            let minutosAviso = 0;
+            let updates = {};
+
+            // Logica: entre 31 e 40 minutos, dispara o de 40m
+            if (minFaltando <= 40 && minFaltando > 30 && !ag.lembrete40m) {
+                dispararAviso = true;
+                minutosAviso = 40;
+                updates = { lembrete40m: true };
+            } 
+            // Logica: entre -10 e 30 minutos, dispara o de 30m
+            else if (minFaltando <= 30 && minFaltando >= -10 && !ag.lembrete30m) {
+                dispararAviso = true;
+                minutosAviso = 30;
+                // Garante que o de 40m fique marcado também para não disparar duplicado depois
+                updates = { lembrete30m: true, lembrete40m: true };
+            }
+
+            if (dispararAviso) {
+                const msgConfirmacao = gerarTextoConfirmacao(ag);
+                let numLimpo = ag.telCliente ? ag.telCliente.replace(/\D/g, '') : '';
+                
+                if (numLimpo && numLimpo.length >= 10 && !numLimpo.startsWith('55')) numLimpo = '55' + numLimpo;
+                else if (numLimpo && numLimpo.length < 10) numLimpo = '55' + numLimpo;
+                
+                const telLimpoEscape = escapeHTML(ag.telCliente);
+                const telLink = numLimpo ? `<a href="https://wa.me/${numLimpo}?text=${encodeURIComponent(msgConfirmacao)}">${telLimpoEscape}</a>` : "Não inf.";
+
+                let compl = ''; 
+                if(ag.tipoImovel === 'casa' && ag.numCasa) compl = `, Nº ${ag.numCasa}`; 
+                if(ag.tipoImovel === 'apartamento') { 
+                    if(ag.condominio) compl += `, Cond. ${ag.condominio}`; 
+                    if(ag.bloco) compl += `, Bloco ${ag.bloco}`; 
+                    if(ag.numApto) compl += `, Apto ${ag.numApto}`; 
+                }
+                
+                const endMaps = ag.endereco ? `${ag.endereco}${compl}` : 'Não inf.'; 
+                let endTele = escapeHTML(endMaps); 
+                
+                if (endMaps !== 'Não inf.') { 
+                    const queryMaps = encodeURIComponent(endMaps); 
+                    // Correção: Link padronizado do Google Maps
+                    endTele = `<a href="https://maps.google.com/?q=${queryMaps}">${escapeHTML(endMaps)}</a>`; 
+                }
+                
+                // Correção de segurança: Evita crash se tipoNegocio for undefined
+                const isVistoria = ag.tipoNegocio && ag.tipoNegocio.includes('Vistoria');
+                const nomePessRaw = isVistoria ? ag.nomeInquilino : (ag.cliente || 'Não inf.');
+                
+                const nomePess = escapeHTML(nomePessRaw);
+                const corretor = escapeHTML(ag.corretor || 'Não inf.');
+                
+                const hPad = String(ag.horaFixa || ag.hourFixa).padStart(2, '0');
+                const mPad = String(ag.minuto).padStart(2, '0');
+                
+                const msg = `⏳ <b>LEMBRETE (SISTEMA): Faltam ${minutosAviso} minutos!</b>\n\nVocês têm um agendamento chegando:\n👤 <b>Pessoa:</b> ${nomePess}\n📞 <b>Tel/Whats:</b> ${telLink}\n📍 <b>Local:</b> ${endTele}\n⏰ <b>Horário:</b> ${hPad}:${mPad}\n👨‍💼 <b>Corretor:</b> ${corretor}`;
+                
+                // Envia pro Telegram e depois marca no banco para não enviar de novo
+                await enviarMensagemTelegram(msg);
+                await atualizarLembreteFirebase(hojeStr, id, updates);
+                
+                console.log(`[${agora.toLocaleTimeString()}] Lembrete de ${minutosAviso}m enviado para ${nomePessRaw}`);
+            }
+        }
+    } catch (error) {
+        console.error("Erro na varredura do Cron:", error);
+    }
+}
+
+// ==========================================
+// LOOP DE EXECUÇÃO CONTÍNUA
+// ==========================================
+console.log("Iniciando serviço de verificação de agendamentos...");
+
+// Executa a primeira vez imediatamente
+verificarAgendamentos();
+
+// Configura para rodar a cada 1 minuto (60000 milissegundos)
+setInterval(verificarAgendamentos, 60000);
