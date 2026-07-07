@@ -179,3 +179,11 @@ verificarAgendamentos();
 
 // Configura para rodar a cada 1 minuto (60000 milissegundos)
 setInterval(verificarAgendamentos, 60000);
+// --- TRUQUE PARA MANTER O RENDER RODANDO DE GRAÇA ---
+const http = require('http');
+http.createServer((req, res) => {
+  res.write('Robo da Agenda Online e Trabalhando!');
+  res.end();
+}).listen(process.env.PORT || 3000, () => {
+  console.log("Servidor web falso iniciado para o Render.");
+});
